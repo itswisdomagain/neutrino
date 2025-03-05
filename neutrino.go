@@ -275,6 +275,7 @@ func (sp *ServerPeer) OnVersion(_ *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 	log.Tracef("Got inv with %d items from %s", len(msg.InvList), p.Addr())
 	newInv := wire.NewMsgInvSizeHint(uint(len(msg.InvList)))
+	var mixMsgs []*chainhash.Hash
 	for _, invVect := range msg.InvList {
 		if invVect.Type == wire.InvTypeTx {
 			log.Tracef("Ignoring tx %s in inv from %v -- "+
@@ -287,6 +288,15 @@ func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 			}
 			continue
 		}
+
+		if invVect.Type == wire.InvTypeMix {
+			mixMsgs = append(mixMsgs, &invVect.Hash)
+			// TODO: Check peer version to see if this peer should be sending
+			// mix inv; and if we disabled mixing and informed all peers, then
+			// disconnect this peer for sending mix inv.
+			continue
+		}
+
 		err := newInv.AddInvVect(invVect)
 		if err != nil {
 			log.Errorf("Failed to add inventory vector: %s", err)
@@ -294,8 +304,8 @@ func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 		}
 	}
 
-	if len(newInv.InvList) > 0 {
-		sp.server.blockManager.QueueInv(newInv, sp)
+	if len(newInv.InvList) > 0 || len(mixMsgs) > 0 {
+		sp.server.blockManager.QueueInv(newInv, mixMsgs, sp)
 	}
 }
 
@@ -1558,7 +1568,7 @@ func NewPeerConfig(sp *ServerPeer) *peer.Config {
 		UserAgentVersion: sp.server.userAgentVersion,
 		ChainParams:      &sp.server.chainParams,
 		Services:         sp.server.services,
-		ProtocolVersion:  wire.AddrV2Version,
+		ProtocolVersion:  wire.MixVersion,
 		DisableRelayTx:   true,
 	}
 }
@@ -1656,6 +1666,11 @@ func (s *ChainService) ChainParams() chaincfg.Params {
 
 // Start begins connecting to peers and syncing the blockchain.
 func (s *ChainService) Start(ctx context.Context) error {
+	return s.StartWithMixing(ctx, nil)
+}
+
+// Start begins connecting to peers and syncing the blockchain.
+func (s *ChainService) StartWithMixing(ctx context.Context, w MixMessageAccepter) error {
 	// Already started?
 	if atomic.AddInt32(&s.started, 1) != 1 {
 		return nil
@@ -1685,7 +1700,7 @@ func (s *ChainService) Start(ctx context.Context) error {
 	// Start the address manager and block manager, both of which are
 	// needed by peers.
 	s.addrManager.Start()
-	s.blockManager.Start()
+	s.blockManager.Start(w)
 	s.blockSubscriptionMgr.Start()
 	if err := s.workManager.Start(); err != nil {
 		return fmt.Errorf("unable to start work manager: %v", err)

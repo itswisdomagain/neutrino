@@ -5,6 +5,7 @@ package neutrino
 import (
 	"bytes"
 	"container/list"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -12,12 +13,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"decred.org/dcrwallet/v4/lru"
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/gcs"
 	"github.com/btcsuite/btcd/btcutil/gcs/builder"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/mixing"
+	"github.com/btcsuite/btcd/mixing/mixpool"
+
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/neutrino/banman"
 	"github.com/lightninglabs/neutrino/blockntfns"
@@ -56,8 +61,9 @@ type newPeerMsg struct {
 // invMsg packages a bitcoin inv message and the peer it came from together
 // so the block handler has access to that information.
 type invMsg struct {
-	inv  *wire.MsgInv
-	peer *ServerPeer
+	inv     *wire.MsgInv
+	mixMsgs []*chainhash.Hash
+	peer    *ServerPeer
 }
 
 // headersMsg packages a bitcoin headers message and the peer it came from
@@ -111,6 +117,10 @@ type blockManagerCfg struct {
 		options ...QueryOption)
 }
 
+type MixMessageAccepter interface {
+	AcceptMixMessage(msg mixing.Message) error
+}
+
 // blockManager provides a concurrency safe block manager for handling all
 // incoming blocks.
 type blockManager struct { // nolint:maligned
@@ -118,6 +128,11 @@ type blockManager struct { // nolint:maligned
 	shutdown int32 // To be used atomically.
 
 	cfg *blockManagerCfg
+
+	// mixWallet should be assigned when starting the blockManager to ensure
+	// proper processing of mix messages received from peers. Mix messages will
+	// be ignored if mixWallet is nil.
+	mixWallet MixMessageAccepter
 
 	// blkHeaderProgressLogger is a progress logger that we'll use to
 	// update the number of blocker headers we've processed in the past 10
@@ -206,6 +221,11 @@ type blockManager struct { // nolint:maligned
 	minRetargetTimespan int64 // target timespan / adjustment factor
 	maxRetargetTimespan int64 // target timespan * adjustment factor
 	blocksPerRetarget   int32 // target timespan / target time per block
+
+	// seenMixMsgs record hashes of received inventoried mix messages. Once a
+	// message is fetched and processed from one peer, the hash is added to the
+	// cache to avoid fetching it again from other peers that also announce it.
+	seenMixMsgs lru.Cache[chainhash.Hash]
 }
 
 // newBlockManager returns a new bitcoin block manager.  Use Start to begin
@@ -283,13 +303,14 @@ func newBlockManager(cfg *blockManagerCfg) (*blockManager, error) {
 }
 
 // Start begins the core block handler which processes block and inv messages.
-func (b *blockManager) Start() {
+func (b *blockManager) Start(mixWallet MixMessageAccepter) {
 	// Already started?
 	if atomic.AddInt32(&b.started, 1) != 1 {
 		return
 	}
 
 	log.Trace("Starting block manager")
+	b.mixWallet = mixWallet
 	b.wg.Add(2)
 	go b.blockHandler()
 	go func() {
@@ -2244,7 +2265,7 @@ func (b *blockManager) BlockHeadersSynced() bool {
 }
 
 // QueueInv adds the passed inv message and peer to the block handling queue.
-func (b *blockManager) QueueInv(inv *wire.MsgInv, sp *ServerPeer) {
+func (b *blockManager) QueueInv(inv *wire.MsgInv, mixMsgs []*chainhash.Hash, sp *ServerPeer) {
 	// No channel handling here because peers do not need to block on inv
 	// messages.
 	if atomic.LoadInt32(&b.shutdown) != 0 {
@@ -2252,7 +2273,7 @@ func (b *blockManager) QueueInv(inv *wire.MsgInv, sp *ServerPeer) {
 	}
 
 	select {
-	case b.peerChan <- &invMsg{inv: inv, peer: sp}:
+	case b.peerChan <- &invMsg{inv: inv, mixMsgs: mixMsgs, peer: sp}:
 	case <-b.quit:
 		return
 	}
@@ -2261,6 +2282,19 @@ func (b *blockManager) QueueInv(inv *wire.MsgInv, sp *ServerPeer) {
 // handleInvMsg handles inv messages from all peers.
 // We examine the inventory advertised by the remote peer and act accordingly.
 func (b *blockManager) handleInvMsg(imsg *invMsg) {
+	if len(imsg.mixMsgs) > 0 {
+		b.wg.Add(1)
+		go func() {
+			b.handleMixInvs(imsg.peer, imsg.mixMsgs, nil)
+			b.wg.Done()
+		}()
+	}
+
+	if len(imsg.inv.InvList) == 0 {
+		// no block inv to process, return early
+		return
+	}
+
 	// Attempt to find the final block in the inventory list.  There may
 	// not be one.
 	lastBlock := -1
@@ -2339,6 +2373,83 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 			}
 			b.lastRequested = invVects[lastBlock].Hash
 		}
+	}
+}
+
+func (b *blockManager) handleMixInvs(peer *ServerPeer, hashes []*chainhash.Hash,
+	onlyByID map[[33]byte]struct{}) {
+
+	const opf = "spv.handleMixInvs(%v): %w"
+
+	// Ignore already-processed messages
+	unseen := hashes[:0]
+	for _, h := range hashes {
+		if !b.seenMixMsgs.Contains(*h) {
+			unseen = append(unseen, h)
+		}
+	}
+	if len(unseen) == 0 {
+		return
+	}
+
+	msgs, err := peer.MixMessages(unseen)
+	if err.Error() == "not found" { // TODO!: errors.Is(err, errors.NotExist)
+		err = nil
+		// Remove notfound txs.
+		prevMsgs, prevUnseen := msgs, unseen
+		msgs, unseen = msgs[:0], unseen[:0]
+		for i, msg := range prevMsgs {
+			if msg != nil {
+				msgs = append(msgs, msg)
+				unseen = append(unseen, prevUnseen[i])
+			}
+		}
+	}
+	if err != nil {
+		err := fmt.Errorf(opf, peer.Addr(), err)
+		log.Warn(err)
+		return
+	}
+
+	// Mark messages as processed so they are not queried from other nodes
+	// who announce them in the future.
+	for _, h := range unseen {
+		b.seenMixMsgs.Add(*h)
+	}
+
+	requestUnknownPRs := make(map[chainhash.Hash]struct{})
+	unknownPRIDs := make(map[[33]byte]struct{})
+
+	// Accept mix messages to the wallet's mixpool.  If any KE was an
+	// orphan and does not reference its own PR, request the previous
+	// messages as well.
+	for _, msg := range msgs {
+		if len(onlyByID) != 0 {
+			if _, ok := onlyByID[[33]byte(msg.Pub())]; !ok {
+				continue
+			}
+		}
+
+		err := b.mixWallet.AcceptMixMessage(msg)
+		var missingPRErr *mixpool.MissingOwnPRError
+		if errors.As(err, &missingPRErr) {
+			ke := msg.(*wire.MsgMixKeyExchange)
+			log.Debugf("will request unknown PR from %x", ke.Identity[:])
+			requestUnknownPRs[missingPRErr.MissingPR] = struct{}{}
+			unknownPRIDs[ke.Identity] = struct{}{}
+		} else if err != nil {
+			log.Warn(fmt.Errorf(opf, peer.Addr(), err))
+		}
+	}
+
+	if len(requestUnknownPRs) > 0 {
+		requestUnknownPRs := make(map[chainhash.Hash]struct{})
+		unknownPRs := make([]*chainhash.Hash, 0, len(requestUnknownPRs))
+		for hash := range requestUnknownPRs {
+			hash := hash
+			unknownPRs = append(unknownPRs, &hash)
+		}
+		b.handleMixInvs(peer, unknownPRs, unknownPRIDs)
 	}
 }
 
