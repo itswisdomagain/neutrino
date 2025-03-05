@@ -117,8 +117,9 @@ type blockManagerCfg struct {
 		options ...QueryOption)
 }
 
-type MixMessageAccepter interface {
+type MixWallet interface {
 	AcceptMixMessage(msg mixing.Message) error
+	MixMessage(hash *chainhash.Hash) (mixing.Message, error)
 }
 
 // blockManager provides a concurrency safe block manager for handling all
@@ -132,7 +133,7 @@ type blockManager struct { // nolint:maligned
 	// mixWallet should be assigned when starting the blockManager to ensure
 	// proper processing of mix messages received from peers. Mix messages will
 	// be ignored if mixWallet is nil.
-	mixWallet MixMessageAccepter
+	mixWallet MixWallet
 
 	// blkHeaderProgressLogger is a progress logger that we'll use to
 	// update the number of blocker headers we've processed in the past 10
@@ -303,7 +304,7 @@ func newBlockManager(cfg *blockManagerCfg) (*blockManager, error) {
 }
 
 // Start begins the core block handler which processes block and inv messages.
-func (b *blockManager) Start(mixWallet MixMessageAccepter) {
+func (b *blockManager) Start(mixWallet MixWallet) {
 	// Already started?
 	if atomic.AddInt32(&b.started, 1) != 1 {
 		return
@@ -2279,10 +2280,14 @@ func (b *blockManager) QueueInv(inv *wire.MsgInv, mixMsgs []*chainhash.Hash, sp 
 	}
 }
 
+func (b *blockManager) mixingEnabled() bool {
+	return b.mixWallet != nil
+}
+
 // handleInvMsg handles inv messages from all peers.
 // We examine the inventory advertised by the remote peer and act accordingly.
 func (b *blockManager) handleInvMsg(imsg *invMsg) {
-	if len(imsg.mixMsgs) > 0 {
+	if len(imsg.mixMsgs) > 0 && b.mixingEnabled() {
 		b.wg.Add(1)
 		go func() {
 			b.handleMixInvs(imsg.peer, imsg.mixMsgs, nil)

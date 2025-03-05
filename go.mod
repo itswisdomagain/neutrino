@@ -41,7 +41,6 @@ require (
 	go.etcd.io/bbolt v1.3.8 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
-	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
@@ -49,7 +48,4 @@ go 1.24.0
 
 toolchain go1.24.3
 
-replace (
-	github.com/btcsuite/btcd => ../btcd
-	github.com/decred/dcrd/mixing => ../dcrd/mixing
-)
+replace github.com/btcsuite/btcd => ../btcd

@@ -12,6 +12,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/gcs"
 	"github.com/btcsuite/btcd/btcutil/gcs/builder"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/mixing"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/neutrino/banman"
 	"github.com/lightninglabs/neutrino/cache"
@@ -946,6 +947,54 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	}
 
 	return foundBlock, nil
+}
+
+// PublishMixMessages sends hashes of mix messages to connected peers. Peers
+// that require the full mix messages can send a getdata request with the hashes
+// they need data for.
+func (s *ChainService) PublishMixMessages(msgs ...mixing.Message) error {
+	const opf = "spv.PublishMixMessages: %v"
+	if !s.blockManager.mixingEnabled() {
+		return fmt.Errorf(opf, "mixing is not configured")
+	}
+
+	// When we inventory a KE, also add our own PR hash from our KE
+	// message to recently-inventoried message LRU, so they can be queried
+	// by nodes that learn of them through the KE.
+	var ownPRs []*chainhash.Hash
+
+	msg := wire.NewMsgInvSizeHint(uint(len(msgs)))
+	for _, mixMsg := range msgs {
+		mixMsgHash := mixMsg.Hash()
+		err := msg.AddInvVect(wire.NewInvVect(wire.InvTypeMix, &mixMsgHash))
+		if err != nil {
+			return fmt.Errorf(opf, err)
+		}
+		if ke, ok := mixMsg.(*wire.MsgMixKeyExchange); ok {
+			ownPRs = append(ownPRs, &ke.SeenPRs[ke.Pos])
+		}
+	}
+
+	peers := s.Peers()
+	var mixingPeers int
+	for _, sp := range peers {
+		if sp.ProtocolVersion() < wire.MixVersion {
+			continue
+		}
+		mixingPeers++
+		for _, inv := range msg.InvList {
+			sp.InvsSent().Add(inv.Hash)
+		}
+		for _, prHash := range ownPRs {
+			sp.InvsSent().Add(*prHash)
+		}
+		sp.QueueMessage(msg, nil)
+	}
+	if mixingPeers == 0 {
+		s := "no connected peers support the mixing protocol version"
+		return fmt.Errorf(opf, s)
+	}
+	return nil
 }
 
 // sendTransaction sends a transaction to all peers. It returns an error if any

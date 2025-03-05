@@ -20,6 +20,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/connmgr"
+	"github.com/btcsuite/btcd/mixing"
 	"github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -290,7 +291,9 @@ func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 		}
 
 		if invVect.Type == wire.InvTypeMix {
-			mixMsgs = append(mixMsgs, &invVect.Hash)
+			if sp.server.blockManager.mixingEnabled() {
+				mixMsgs = append(mixMsgs, &invVect.Hash)
+			}
 			// TODO: Check peer version to see if this peer should be sending
 			// mix inv; and if we disabled mixing and informed all peers, then
 			// disconnect this peer for sending mix inv.
@@ -457,6 +460,57 @@ func (sp *ServerPeer) OnAddrV2(_ *peer.Peer, msg *wire.MsgAddrV2) {
 
 	// Add addresses to the address manager.
 	sp.server.addrManager.AddAddresses(addrs, sp.NA())
+}
+
+// OnGetData is called when a peer receives an GetData message from its peer.
+func (sp *ServerPeer) OnGetData(p *peer.Peer, msg *wire.MsgGetData) {
+	sp.server.wg.Add(1)
+	go func() {
+		defer sp.server.wg.Done()
+
+		// Ensure that the data was (recently) announced using an inv.
+		var mixHashes []*chainhash.Hash
+		var notFound []*wire.InvVect
+		for _, inv := range msg.InvList {
+			if !p.InvsSent().Contains(inv.Hash) {
+				notFound = append(notFound, inv)
+				continue
+			}
+			if inv.Type != wire.InvTypeMix {
+				notFound = append(notFound, inv)
+				continue
+			}
+			if !sp.server.blockManager.mixingEnabled() {
+				notFound = append(notFound, inv)
+				continue
+			}
+			mixHashes = append(mixHashes, &inv.Hash)
+		}
+
+		// Search for requested mix messages
+		var foundMixMsgs []mixing.Message
+		if len(mixHashes) != 0 {
+			for _, hash := range mixHashes {
+				msg, err := sp.server.blockManager.mixWallet.MixMessage(hash)
+				if err != nil {
+					invvect := wire.NewInvVect(wire.InvTypeMix, hash)
+					notFound = append(notFound, invvect)
+					continue
+				}
+				foundMixMsgs = append(foundMixMsgs, msg)
+			}
+		}
+
+		// Send all found mix messages
+		for _, msg := range foundMixMsgs {
+			p.QueueMessage(msg, nil)
+		}
+
+		// Send notfound message for all missing or unannounced data.
+		if len(notFound) != 0 {
+			p.QueueMessage(&wire.MsgNotFound{InvList: notFound}, nil)
+		}
+	}()
 }
 
 // OnRead is invoked when a peer receives a message and it is used to update
@@ -1559,6 +1613,7 @@ func NewPeerConfig(sp *ServerPeer) *peer.Config {
 			OnFeeFilter: sp.OnFeeFilter,
 			OnAddr:      sp.OnAddr,
 			OnAddrV2:    sp.OnAddrV2,
+			OnGetData:   sp.OnGetData,
 			OnRead:      sp.OnRead,
 			OnWrite:     sp.OnWrite,
 		},
@@ -1670,7 +1725,7 @@ func (s *ChainService) Start(ctx context.Context) error {
 }
 
 // Start begins connecting to peers and syncing the blockchain.
-func (s *ChainService) StartWithMixing(ctx context.Context, w MixMessageAccepter) error {
+func (s *ChainService) StartWithMixing(ctx context.Context, mixWallet MixWallet) error {
 	// Already started?
 	if atomic.AddInt32(&s.started, 1) != 1 {
 		return nil
@@ -1700,7 +1755,7 @@ func (s *ChainService) StartWithMixing(ctx context.Context, w MixMessageAccepter
 	// Start the address manager and block manager, both of which are
 	// needed by peers.
 	s.addrManager.Start()
-	s.blockManager.Start(w)
+	s.blockManager.Start(mixWallet)
 	s.blockSubscriptionMgr.Start()
 	if err := s.workManager.Start(); err != nil {
 		return fmt.Errorf("unable to start work manager: %v", err)
