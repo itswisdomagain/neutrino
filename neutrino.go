@@ -291,7 +291,7 @@ func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 		}
 
 		if invVect.Type == wire.InvTypeMix {
-			if sp.server.blockManager.mixingEnabled() {
+			if sp.server.MixingEnabled() {
 				mixMsgs = append(mixMsgs, &invVect.Hash)
 			}
 			// TODO: Check peer version to see if this peer should be sending
@@ -307,8 +307,16 @@ func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 		}
 	}
 
-	if len(newInv.InvList) > 0 || len(mixMsgs) > 0 {
-		sp.server.blockManager.QueueInv(newInv, mixMsgs, sp)
+	if len(newInv.InvList) > 0 {
+		sp.server.blockManager.QueueInv(newInv, sp)
+	}
+
+	if len(mixMsgs) > 0 {
+		sp.server.wg.Add(1)
+		go func() {
+			sp.server.mixManager.handleMixInvs(p, mixMsgs, nil, sp.quit)
+			sp.server.wg.Done()
+		}()
 	}
 }
 
@@ -462,36 +470,50 @@ func (sp *ServerPeer) OnAddrV2(_ *peer.Peer, msg *wire.MsgAddrV2) {
 	sp.server.addrManager.AddAddresses(addrs, sp.NA())
 }
 
+// OnMixMessage is called when a peer receives a mix** message from its peer.
+func (sp *ServerPeer) OnMixMessage(rp *peer.Peer, msg mixing.Message) {
+	if !sp.server.MixingEnabled() {
+		log.Errorf("received unrequested mix msg from %v", rp.Addr())
+		rp.Disconnect()
+		return
+	}
+
+	err := sp.server.mixManager.receivedMixMessageFromPeer(rp, msg, sp.quit)
+	if err != nil {
+		log.Error(err)
+		if errors.Is(err, errUnrequestedMixMsg) {
+			rp.Disconnect()
+		}
+	}
+}
+
 // OnGetData is called when a peer receives an GetData message from its peer.
 func (sp *ServerPeer) OnGetData(p *peer.Peer, msg *wire.MsgGetData) {
 	sp.server.wg.Add(1)
 	go func() {
 		defer sp.server.wg.Done()
 
-		// Ensure that the data was (recently) announced using an inv.
 		var mixHashes []*chainhash.Hash
 		var notFound []*wire.InvVect
 		for _, inv := range msg.InvList {
-			if !p.InvsSent().Contains(inv.Hash) {
+			switch inv.Type {
+			case wire.InvTypeMix:
+				if sp.server.MixingEnabled() {
+					mixHashes = append(mixHashes, &inv.Hash)
+				} else {
+					notFound = append(notFound, inv)
+				}
+
+			default:
 				notFound = append(notFound, inv)
-				continue
 			}
-			if inv.Type != wire.InvTypeMix {
-				notFound = append(notFound, inv)
-				continue
-			}
-			if !sp.server.blockManager.mixingEnabled() {
-				notFound = append(notFound, inv)
-				continue
-			}
-			mixHashes = append(mixHashes, &inv.Hash)
 		}
 
 		// Search for requested mix messages
 		var foundMixMsgs []mixing.Message
 		if len(mixHashes) != 0 {
 			for _, hash := range mixHashes {
-				msg, err := sp.server.blockManager.mixWallet.MixMessage(hash)
+				msg, err := sp.server.mixManager.handleMixMsgGetData(p, hash)
 				if err != nil {
 					invvect := wire.NewInvVect(wire.InvTypeMix, hash)
 					notFound = append(notFound, invvect)
@@ -758,6 +780,7 @@ type ChainService struct { // nolint:maligned
 	connManager          *connmgr.ConnManager
 	blockManager         *blockManager
 	blockSubscriptionMgr *blockntfns.SubscriptionManager
+	mixManager           *mixManager
 	newPeers             chan *ServerPeer
 	donePeers            chan *ServerPeer
 	query                chan interface{}
@@ -1605,17 +1628,18 @@ func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 func NewPeerConfig(sp *ServerPeer) *peer.Config {
 	return &peer.Config{
 		Listeners: peer.MessageListeners{
-			OnVersion:   sp.OnVersion,
-			OnVerAck:    sp.OnVerAck,
-			OnInv:       sp.OnInv,
-			OnHeaders:   sp.OnHeaders,
-			OnReject:    sp.OnReject,
-			OnFeeFilter: sp.OnFeeFilter,
-			OnAddr:      sp.OnAddr,
-			OnAddrV2:    sp.OnAddrV2,
-			OnGetData:   sp.OnGetData,
-			OnRead:      sp.OnRead,
-			OnWrite:     sp.OnWrite,
+			OnVersion:    sp.OnVersion,
+			OnVerAck:     sp.OnVerAck,
+			OnInv:        sp.OnInv,
+			OnHeaders:    sp.OnHeaders,
+			OnReject:     sp.OnReject,
+			OnFeeFilter:  sp.OnFeeFilter,
+			OnAddr:       sp.OnAddr,
+			OnAddrV2:     sp.OnAddrV2,
+			OnGetData:    sp.OnGetData,
+			OnMixMessage: sp.OnMixMessage,
+			OnRead:       sp.OnRead,
+			OnWrite:      sp.OnWrite,
 		},
 		NewestBlock:      sp.newestBlock,
 		HostToNetAddress: sp.server.addrManager.HostToNetAddress,
@@ -1752,10 +1776,13 @@ func (s *ChainService) StartWithMixing(ctx context.Context, mixWallet MixWallet)
 		}
 	}
 
+	// Initialize the mixManager.
+	s.mixManager = startMixManager(mixWallet)
+
 	// Start the address manager and block manager, both of which are
 	// needed by peers.
 	s.addrManager.Start()
-	s.blockManager.Start(mixWallet)
+	s.blockManager.Start()
 	s.blockSubscriptionMgr.Start()
 	if err := s.workManager.Start(); err != nil {
 		return fmt.Errorf("unable to start work manager: %v", err)
@@ -1821,6 +1848,10 @@ func (s *ChainService) Stop() error {
 	close(s.quit)
 	s.wg.Wait()
 	return returnErr
+}
+
+func (s *ChainService) MixingEnabled() bool {
+	return s.mixManager != nil // TODO: race.
 }
 
 // IsCurrent lets the caller know whether the chain service's block manager

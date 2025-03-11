@@ -954,7 +954,7 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 // they need data for.
 func (s *ChainService) PublishMixMessages(msgs ...mixing.Message) error {
 	const opf = "spv.PublishMixMessages: %v"
-	if !s.blockManager.mixingEnabled() {
+	if !s.MixingEnabled() {
 		return fmt.Errorf(opf, "mixing is not configured")
 	}
 
@@ -982,13 +982,7 @@ func (s *ChainService) PublishMixMessages(msgs ...mixing.Message) error {
 			continue
 		}
 		mixingPeers++
-		for _, inv := range msg.InvList {
-			sp.InvsSent().Add(inv.Hash)
-		}
-		for _, prHash := range ownPRs {
-			sp.InvsSent().Add(*prHash)
-		}
-		sp.QueueMessage(msg, nil)
+		s.mixManager.sendMixMsgInv(sp.Peer, msg, ownPRs)
 	}
 	if mixingPeers == 0 {
 		s := "no connected peers support the mixing protocol version"
