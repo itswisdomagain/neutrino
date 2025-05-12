@@ -47,4 +47,4 @@ go 1.24.0
 toolchain go1.24.3
 
 // replace github.com/btcsuite/btcd => ../btcd
-replace github.com/btcsuite/btcd => github.com/itswisdomagain/btcd v0.0.0-20250509161855-d406bf0ab895
+replace github.com/btcsuite/btcd => github.com/itswisdomagain/btcd v0.0.0-20250512111510-48c8f559c9be
