@@ -96,7 +96,7 @@ type mixManager struct {
 	peerStates *sync.Map // k=peerID, v=*mixPeerState
 }
 
-func startMixManager(mixWallet MixWallet) *mixManager {
+func newMixManager(mixWallet MixWallet) *mixManager {
 	return &mixManager{
 		mixWallet:   mixWallet,
 		seenMixMsgs: lru.NewCache[chainhash.Hash](2000),
@@ -108,9 +108,6 @@ func startMixManager(mixWallet MixWallet) *mixManager {
 // mix msgs from the peer if we don't already have them.
 func (mm *mixManager) handleMixInvs(peer *peer.Peer, hashes []*chainhash.Hash,
 	onlyByID map[[33]byte]struct{}, quit <-chan struct{}) {
-
-	// TODO: Remove
-	const opf = "spv.handleMixInvs(%v): %w"
 
 	// Ignore already-processed messages
 	unseen := hashes[:0]
@@ -137,7 +134,7 @@ func (mm *mixManager) handleMixInvs(peer *peer.Peer, hashes []*chainhash.Hash,
 		}
 	}
 	if err != nil {
-		err := fmt.Errorf(opf, peer.Addr(), err)
+		err := fmt.Errorf("spv.handleMixInvs(%v): %w", peer.Addr(), err)
 		log.Warn(err)
 		return
 	}
@@ -169,7 +166,7 @@ func (mm *mixManager) handleMixInvs(peer *peer.Peer, hashes []*chainhash.Hash,
 			requestUnknownPRs[missingPRErr.MissingPR] = struct{}{}
 			unknownPRIDs[ke.Identity] = struct{}{}
 		} else if err != nil {
-			log.Warn(fmt.Errorf(opf, peer.Addr(), err))
+			log.Warn(fmt.Errorf("spv.handleMixInvs(%v): %w", peer.Addr(), err))
 		}
 	}
 
@@ -193,8 +190,6 @@ func (mm *mixManager) handleMixInvs(peer *peer.Peer, hashes []*chainhash.Hash,
 func (mm *mixManager) requestMixMessagesFromPeer(p *peer.Peer, hashes []*chainhash.Hash,
 	quit <-chan struct{}) ([]mixing.Message, error) {
 
-	opf := "remotepeer(%v).MixMessages: %w" // TODO
-
 	psv, _ := mm.peerStates.LoadOrStore(p.ID(), newMixPeerState())
 	ps := psv.(*mixPeerState)
 
@@ -203,7 +198,7 @@ func (mm *mixManager) requestMixMessagesFromPeer(p *peer.Peer, hashes []*chainha
 	for i, h := range hashes {
 		err := m.AddInvVect(wire.NewInvVect(wire.InvTypeMix, h))
 		if err != nil {
-			return nil, fmt.Errorf(opf, p.Addr(), err)
+			return nil, fmt.Errorf("requestMixMessagesFromPeer(%v): %w", p.Addr(), err)
 		}
 		cs[i] = make(chan mixing.Message, 1)
 		if !ps.addRequestedMixMsg(h, cs[i]) {
@@ -211,7 +206,7 @@ func (mm *mixManager) requestMixMessagesFromPeer(p *peer.Peer, hashes []*chainha
 				ps.deleteRequestedMixMsg(h)
 			}
 			err = fmt.Errorf("mix msg %v is already being requested from this peer", h)
-			return nil, fmt.Errorf(opf, p.Addr(), err)
+			return nil, fmt.Errorf("requestMixMessagesFromPeer(%v): %w", p.Addr(), err)
 		}
 	}
 
@@ -234,12 +229,9 @@ func (mm *mixManager) requestMixMessagesFromPeer(p *peer.Peer, hashes []*chainha
 			for _, h := range hashes[i:] {
 				ps.deleteRequestedMixMsg(h)
 			}
-			err := fmt.Errorf(opf, p.Addr(), fmt.Errorf("peer appears stalled"))
+			err := fmt.Errorf("requestMixMessagesFromPeer(%v): peer appears stalled", p.Addr())
 			p.Disconnect()
 			return nil, err
-		case <-p.DisconnectChan():
-			stalled.Stop()
-			return nil, fmt.Errorf("peer disconnected")
 		case m, ok := <-cs[i]:
 			msgs[i] = m
 			notfound = notfound || !ok
