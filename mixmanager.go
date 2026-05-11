@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"decred.org/dcrwallet/v4/lru"
+	"decred.org/dcrwallet/v5/lru"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/mixing"
 	"github.com/btcsuite/btcd/mixing/mixpool"
@@ -158,11 +158,11 @@ func (mm *mixManager) handleMixInvs(peer *peer.Peer, hashes []*chainhash.Hash,
 			}
 		}
 
-		err := mm.mixWallet.AcceptMixMessage(msg)
+		err := mm.mixWallet.AcceptMixMessageBySource(msg, peer)
 		var missingPRErr *mixpool.MissingOwnPRError
 		if errors.As(err, &missingPRErr) {
 			ke := msg.(*wire.MsgMixKeyExchange)
-			log.Debugf("will request unknown PR from %x", ke.Identity[:])
+			log.Debugf("Will request unknown PR from %x", ke.Identity[:])
 			requestUnknownPRs[missingPRErr.MissingPR] = struct{}{}
 			unknownPRIDs[ke.Identity] = struct{}{}
 		} else if err != nil {
